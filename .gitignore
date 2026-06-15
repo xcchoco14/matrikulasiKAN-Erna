@@ -11,3 +11,17 @@
 .venv/
 __pycache__/
 .ipynb_checkpoints/
+
+# Mengabaikan folder output hasil running
+kan_baseline_results_v2/
+kan_baseline_results/
+
+# Mengabaikan environment virtual
+.venv/
+venv/
+env/
+
+# Mengabaikan file sistem Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
