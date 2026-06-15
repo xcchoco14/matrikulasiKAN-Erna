@@ -1,0 +1,13 @@
+# Mengabaikan folder dataset medis
+/data/
+/dataset/
+
+# Mengabaikan model yang sudah ditraining agar repo tidak berat
+*.pth
+*.pt
+*.h5
+
+# Mengabaikan file sistem dan virtual environment
+.venv/
+__pycache__/
+.ipynb_checkpoints/
