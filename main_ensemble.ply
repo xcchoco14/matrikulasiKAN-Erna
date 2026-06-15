@@ -1,0 +1,1440 @@
+"""
+KAN Baseline vs Ensemble Soft Voting — Combined Evaluator
+==========================================================
+Object-Oriented implementation comparing two KAN strategies across
+9 medical datasets:
+
+  STRATEGY A — Baseline (Single KAN, seed=42)
+  STRATEGY B — Ensemble Soft Voting (5 KAN sub-models, seeds 0-4,
+                averaged probability logits before argmax)
+
+Both strategies share identical hyperparameters and are evaluated with:
+  - 5-Fold Stratified Cross-Validation (per-fold metrics stored)
+  - 95% Confidence Intervals via t-distribution (correct for small n)
+  - Hold-out test set (20%, stratified, fixed split)
+  - Box plots + line charts per dataset per strategy
+  - Side-by-side comparison plots (Baseline vs Ensemble)
+  - Confusion matrices for both strategies
+  - JSON + CSV export of all results
+
+Revision-compliant based on professor's feedback:
+  1. Per-fold Accuracy, Precision, Recall, F1 visualized via box plots
+  2. 95% CIs reported as "mean ± half-width [lower, upper]"
+  3. Single OOP file — no external module dependencies beyond pip packages
+
+Datasets (9):
+  1. Breast Cancer (sklearn)        6. Dermatology
+  2. Hepatitis                       7. WPBC
+  3. Liver (BUPA)                    8. Heart Disease (Cleveland)
+  4. Parkinson's (Telemonitoring)    9. CTG (Cardiotocography)
+  5. Diabetes (Pima)
+
+Usage:
+    python kan_baseline_ensemble_combined.py
+"""
+
+import os
+import json
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import seaborn as sns
+import torch
+import torch.nn as nn
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import List, Dict, Tuple, Optional
+
+from sklearn.datasets import load_breast_cancer
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score,
+    f1_score, confusion_matrix, classification_report
+)
+from scipy import stats
+from ucimlrepo import fetch_ucirepo
+from kan import KAN
+
+warnings.filterwarnings("ignore")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SECTION 1 — DATA CLASSES
+# ═════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class FoldMetrics:
+    """Metrics for one CV fold of one strategy."""
+    fold: int
+    accuracy: float
+    precision: float
+    recall: float
+    f1: float
+    train_loss: float
+    val_loss: float
+
+
+@dataclass
+class ConfidenceInterval:
+    """95% CI for a single metric computed via t-distribution."""
+    mean: float
+    lower: float
+    upper: float
+    std: float
+
+    @property
+    def half_width(self) -> float:
+        return (self.upper - self.lower) / 2
+
+    def __str__(self) -> str:
+        return (
+            f"{self.mean:.4f} ± {self.half_width:.4f}"
+            f"  [{self.lower:.4f}, {self.upper:.4f}]"
+        )
+
+
+@dataclass
+class StrategyResult:
+    """
+    Full result for ONE strategy (Baseline or Ensemble) on ONE dataset.
+    Stores per-fold CV metrics, computed CIs, and final holdout scores.
+    """
+    strategy_name: str           # "Baseline" or "Ensemble"
+    dataset_name: str
+    n_samples: int
+    n_features: int
+    n_classes: int
+
+    fold_metrics: List[FoldMetrics] = field(default_factory=list)
+
+    # Filled by compute_confidence_intervals()
+    ci_accuracy:  Optional[ConfidenceInterval] = None
+    ci_precision: Optional[ConfidenceInterval] = None
+    ci_recall:    Optional[ConfidenceInterval] = None
+    ci_f1:        Optional[ConfidenceInterval] = None
+
+    # Final holdout scores
+    holdout_accuracy:  float = 0.0
+    holdout_precision: float = 0.0
+    holdout_recall:    float = 0.0
+    holdout_f1:        float = 0.0
+    holdout_loss:      float = 0.0
+
+    def compute_confidence_intervals(self, confidence: float = 0.95) -> None:
+        """Fill ci_* fields using t-distribution (correct for k=5 folds)."""
+        for metric in ["accuracy", "precision", "recall", "f1"]:
+            values = np.array([getattr(fm, metric) for fm in self.fold_metrics])
+            n = len(values)
+            mean = values.mean()
+            std = values.std(ddof=1)
+            t_crit = stats.t.ppf((1 + confidence) / 2, df=n - 1)
+            margin = t_crit * (std / np.sqrt(n))
+            ci = ConfidenceInterval(
+                mean=mean,
+                lower=max(0.0, mean - margin),
+                upper=min(1.0, mean + margin),
+                std=std
+            )
+            setattr(self, f"ci_{metric}", ci)
+
+
+@dataclass
+class DatasetPair:
+    """Bundles the Baseline and Ensemble results for the same dataset."""
+    dataset_name: str
+    target_names: List[str]
+    baseline: StrategyResult
+    ensemble: StrategyResult
+    # Holdout ground-truth labels and predictions — kept for confusion matrices
+    y_test:            np.ndarray = field(default_factory=lambda: np.array([]))
+    baseline_preds:    np.ndarray = field(default_factory=lambda: np.array([]))
+    ensemble_preds:    np.ndarray = field(default_factory=lambda: np.array([]))
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SECTION 2 — DATASET LOADERS
+# ═════════════════════════════════════════════════════════════════════════════
+
+class BaseDatasetLoader(ABC):
+    """Abstract interface for all dataset loaders."""
+
+    @property
+    @abstractmethod
+    def name(self) -> str: ...
+
+    @abstractmethod
+    def load(self) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+        """Returns (X, y_encoded_0based, target_names)."""
+        ...
+
+    def _encode_and_clean(
+        self,
+        df: pd.DataFrame,
+        target_col: str,
+        drop_cols: Optional[List[str]] = None
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Shared preprocessing: drop cols → replace '?' → encode → impute."""
+        if drop_cols:
+            df = df.drop(columns=drop_cols, errors="ignore")
+        df = df.replace("?", np.nan)
+
+        for col in df.columns:
+            if col == target_col:
+                continue
+            if df[col].dtype == object:
+                le = LabelEncoder()
+                df[col] = le.fit_transform(df[col].astype(str))
+
+        df = df.dropna(subset=[target_col])
+
+        for col in df.columns:
+            if col != target_col and df[col].isnull().any():
+                df[col] = df[col].fillna(df[col].median())
+
+        y_raw = df[target_col].values
+        X = df.drop(columns=[target_col]).values.astype(float)
+        le_t = LabelEncoder()
+        y = le_t.fit_transform(y_raw)
+        return X, y
+
+
+class BreastCancerLoader(BaseDatasetLoader):
+    @property
+    def name(self) -> str:
+        return "Breast Cancer"
+
+    def load(self):
+        data = load_breast_cancer()
+        return data.data, data.target, list(data.target_names)
+
+
+class HepatitisLoader(BaseDatasetLoader):
+    @property
+    def name(self) -> str:
+        return "Hepatitis"
+
+    def load(self):
+        url = ("https://archive.ics.uci.edu/ml/machine-learning-databases"
+               "/hepatitis/hepatitis.data")
+        cols = [
+            "Class", "Age", "Sex", "Steroid", "Antivirals", "Fatigue",
+            "Malaise", "Anorexia", "LiverBig", "LiverFirm", "SpleenPalpable",
+            "Spiders", "Ascites", "Varices", "Bilirubin", "AlkPhosphate",
+            "SGOT", "Albumin", "Protime", "Histology"
+        ]
+        df = pd.read_csv(url, names=cols)
+        X, y = self._encode_and_clean(df, target_col="Class")
+        return X, y, ["Die", "Live"]
+
+
+class LiverLoader(BaseDatasetLoader):
+    @property
+    def name(self) -> str:
+        return "Liver (BUPA)"
+
+    def load(self):
+        url = ("https://archive.ics.uci.edu/ml/machine-learning-databases"
+               "/liver-disorders/bupa.data")
+        cols = ["mcv", "alkphos", "sgpt", "sgot", "gammagt", "drinks", "selector"]
+        df = pd.read_csv(url, names=cols)
+        df["selector"] = df["selector"] - 1
+        X = df.drop(columns=["selector"]).values.astype(float)
+        y = df["selector"].values
+        return X, y, ["Group 1", "Group 2"]
+
+
+class ParkinsonsLoader(BaseDatasetLoader):
+    @property
+    def name(self) -> str:
+        return "Parkinson's"
+
+    def load(self):
+        url = ("https://archive.ics.uci.edu/ml/machine-learning-databases"
+               "/parkinsons/telemonitoring/parkinsons_updrs.data")
+        df = pd.read_csv(url)
+        median_val = df["total_UPDRS"].median()
+        df["target"] = (df["total_UPDRS"] >= median_val).astype(int)
+        drop = ["subject#", "age", "sex", "test_time", "motor_UPDRS", "total_UPDRS"]
+        X, y = self._encode_and_clean(df, target_col="target", drop_cols=drop)
+        return X, y, ["Mild", "Severe"]
+
+
+class DiabetesLoader(BaseDatasetLoader):
+    @property
+    def name(self) -> str:
+        return "Diabetes (Pima)"
+
+    def load(self):
+        url = ("https://raw.githubusercontent.com/jbrownlee/Datasets"
+               "/master/pima-indians-diabetes.data.csv")
+        cols = [
+            "Pregnancies", "Glucose", "BloodPressure", "SkinThickness",
+            "Insulin", "BMI", "DiabetesPedigree", "Age", "Outcome"
+        ]
+        df = pd.read_csv(url, names=cols)
+        X = df.drop(columns=["Outcome"]).values.astype(float)
+        y = df["Outcome"].values
+        return X, y, ["Non-Diabetic", "Diabetic"]
+
+
+class DermatologyLoader(BaseDatasetLoader):
+    @property
+    def name(self) -> str:
+        return "Dermatology"
+
+    def load(self):
+        url = ("https://archive.ics.uci.edu/ml/machine-learning-databases"
+               "/dermatology/dermatology.data")
+        df = pd.read_csv(url, header=None)
+        df.columns = [f"f{i}" for i in range(df.shape[1] - 1)] + ["Class"]
+        X, y = self._encode_and_clean(df, target_col="Class")
+        return X, y, [f"Class {i+1}" for i in range(len(np.unique(y)))]
+
+
+class WPBCLoader(BaseDatasetLoader):
+    @property
+    def name(self) -> str:
+        return "WPBC"
+
+    def load(self):
+        url = ("https://archive.ics.uci.edu/ml/machine-learning-databases"
+               "/breast-cancer-wisconsin/wpbc.data")
+        df = pd.read_csv(url, header=None)
+        df = df.drop(columns=[0])
+        df.columns = ["Outcome"] + [f"f{i}" for i in range(df.shape[1] - 1)]
+        X, y = self._encode_and_clean(df, target_col="Outcome")
+        return X, y, ["Non-Recurrent", "Recurrent"]
+
+
+class HeartDiseaseLoader(BaseDatasetLoader):
+    @property
+    def name(self) -> str:
+        return "Heart Disease"
+
+    def load(self):
+        url = ("https://archive.ics.uci.edu/ml/machine-learning-databases"
+               "/heart-disease/processed.cleveland.data")
+        cols = [
+            "Age", "Sex", "CP", "Trestbps", "Chol", "Fbs", "Restecg",
+            "Thalach", "Exang", "Oldpeak", "Slope", "Ca", "Thal", "Target"
+        ]
+        df = pd.read_csv(url, names=cols)
+        df["Target"] = df["Target"].apply(
+            lambda v: 0 if str(v).strip() == "0" else 1
+        )
+        X, y = self._encode_and_clean(df, target_col="Target")
+        return X, y, ["No Disease", "Disease"]
+
+
+class CTGLoader(BaseDatasetLoader):
+    @property
+    def name(self) -> str:
+        return "CTG"
+
+    def load(self):
+        ctg = fetch_ucirepo(id=193)
+        X_raw = ctg.data.features
+        y_raw = ctg.data.targets
+        if isinstance(y_raw, pd.DataFrame):
+            y_raw = y_raw.iloc[:, 0]
+
+        X_df = X_raw.copy()
+        for col in X_df.columns:
+            if X_df[col].dtype == object:
+                le = LabelEncoder()
+                X_df[col] = le.fit_transform(X_df[col].astype(str))
+        X_df = X_df.fillna(X_df.median())
+        X = X_df.values.astype(float)
+
+        le_t = LabelEncoder()
+        y = le_t.fit_transform(y_raw.values.ravel())
+        n_cls = len(np.unique(y))
+        return X, y, [f"Class {i+1}" for i in range(n_cls)]
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SECTION 3 — KAN TRAINERS (Baseline & Ensemble)
+# ═════════════════════════════════════════════════════════════════════════════
+
+class KANTrainerBase:
+    """
+    Shared base for both Baseline and Ensemble trainers.
+    Handles model construction, tensor conversion, and loss computation.
+    """
+
+    KAN_PARAMS: Dict = {
+        "n_hidden": 5,
+        "grid":     5,
+        "k":        4,
+        "lr":       0.01,
+        "lamb":     0.01,
+        "steps":    50,
+    }
+
+    def __init__(self, num_features: int, num_classes: int, params: Optional[Dict] = None):
+        self.num_features = num_features
+        self.num_classes  = num_classes
+        self.params       = params or self.KAN_PARAMS.copy()
+        self.device       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.loss_fn      = nn.CrossEntropyLoss()
+
+    def _build_model(self, seed: int) -> KAN:
+        return KAN(
+            width=[self.num_features, self.params["n_hidden"], self.num_classes],
+            grid=self.params["grid"],
+            k=self.params["k"],
+            seed=seed,
+            device=self.device
+        )
+
+    def _to_tensor(self, X: np.ndarray, y: np.ndarray) -> Tuple[torch.Tensor, torch.Tensor]:
+        return (
+            torch.from_numpy(X).float().to(self.device),
+            torch.from_numpy(y).long().to(self.device)
+        )
+
+    def _x_tensor(self, X: np.ndarray) -> torch.Tensor:
+        return torch.from_numpy(X).float().to(self.device)
+
+    def _train_one(
+        self,
+        model: KAN,
+        X_tr_t: torch.Tensor,
+        y_tr_t: torch.Tensor,
+        X_va_t: torch.Tensor,
+        y_va_t: torch.Tensor
+    ) -> Tuple[float, float]:
+        """Fit one KAN model and return (train_loss, val_loss)."""
+        model.fit(
+            {
+                "train_input": X_tr_t,
+                "train_label": y_tr_t,
+                "test_input":  X_va_t,
+                "test_label":  y_va_t,
+            },
+            opt="LBFGS",
+            steps=self.params["steps"],
+            lr=self.params["lr"],
+            loss_fn=self.loss_fn,
+            lamb=self.params["lamb"]
+        )
+        with torch.no_grad():
+            tr_loss = self.loss_fn(model(X_tr_t), y_tr_t).item()
+            va_loss = self.loss_fn(model(X_va_t), y_va_t).item()
+        return tr_loss, va_loss
+
+
+class BaselineKANTrainer(KANTrainerBase):
+    """
+    Strategy A — Single KAN model (seed=42).
+    Predictions come directly from one model's argmax logits.
+    """
+
+    def __init__(self, num_features: int, num_classes: int,
+                 params: Optional[Dict] = None, seed: int = 42):
+        super().__init__(num_features, num_classes, params)
+        self.seed  = seed
+        self.model: Optional[KAN] = None
+
+    def fit(
+        self,
+        X_train: np.ndarray, y_train: np.ndarray,
+        X_val:   np.ndarray, y_val:   np.ndarray
+    ) -> Tuple[float, float]:
+        self.model = self._build_model(self.seed)
+        X_tr_t, y_tr_t = self._to_tensor(X_train, y_train)
+        X_va_t, y_va_t = self._to_tensor(X_val,   y_val)
+        return self._train_one(self.model, X_tr_t, y_tr_t, X_va_t, y_va_t)
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        X_t = self._x_tensor(X)
+        with torch.no_grad():
+            return torch.argmax(self.model(X_t), dim=1).cpu().numpy()
+
+    def predict_loss(self, X: np.ndarray, y: np.ndarray) -> float:
+        X_t, y_t = self._to_tensor(X, y)
+        with torch.no_grad():
+            return self.loss_fn(self.model(X_t), y_t).item()
+
+
+class EnsembleKANTrainer(KANTrainerBase):
+    """
+    Strategy B — Soft Voting Ensemble of N KAN sub-models.
+
+    Each sub-model is trained with a different seed (0, 1, …, N-1).
+    Prediction = argmax( mean of all sub-models' softmax probability vectors ).
+    This is 'soft voting' because we average class probabilities, not hard votes.
+    """
+
+    def __init__(
+        self,
+        num_features: int,
+        num_classes:  int,
+        params:       Optional[Dict] = None,
+        n_members:    int = 5
+    ):
+        super().__init__(num_features, num_classes, params)
+        self.n_members = n_members
+        self.models:    List[KAN] = []
+
+    def fit(
+        self,
+        X_train: np.ndarray, y_train: np.ndarray,
+        X_val:   np.ndarray, y_val:   np.ndarray
+    ) -> Tuple[float, float]:
+        """
+        Train all sub-models. Returns average (train_loss, val_loss)
+        computed from averaged soft-voting logits.
+        """
+        self.models = []
+        X_tr_t, y_tr_t = self._to_tensor(X_train, y_train)
+        X_va_t, y_va_t = self._to_tensor(X_val,   y_val)
+
+        for seed in range(self.n_members):
+            model = self._build_model(seed)
+            self._train_one(model, X_tr_t, y_tr_t, X_va_t, y_va_t)
+            self.models.append(model)
+
+        # Compute ensemble losses from averaged logits
+        with torch.no_grad():
+            avg_tr_logits = torch.stack(
+                [m(X_tr_t) for m in self.models]
+            ).mean(dim=0)
+            avg_va_logits = torch.stack(
+                [m(X_va_t) for m in self.models]
+            ).mean(dim=0)
+            tr_loss = self.loss_fn(avg_tr_logits, y_tr_t).item()
+            va_loss = self.loss_fn(avg_va_logits, y_va_t).item()
+
+        return tr_loss, va_loss
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Soft voting: average logits across all sub-models, then argmax."""
+        X_t = self._x_tensor(X)
+        with torch.no_grad():
+            avg_logits = torch.stack(
+                [m(X_t) for m in self.models]
+            ).mean(dim=0)
+            return torch.argmax(avg_logits, dim=1).cpu().numpy()
+
+    def predict_loss(self, X: np.ndarray, y: np.ndarray) -> float:
+        X_t, y_t = self._to_tensor(X, y)
+        with torch.no_grad():
+            avg_logits = torch.stack(
+                [m(X_t) for m in self.models]
+            ).mean(dim=0)
+            return self.loss_fn(avg_logits, y_t).item()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SECTION 4 — CROSS-VALIDATION ENGINE
+# ═════════════════════════════════════════════════════════════════════════════
+
+class CrossValidator:
+    """
+    Runs Stratified K-Fold CV for a given trainer factory function.
+    Returns a list of FoldMetrics — one per fold.
+    """
+
+    def __init__(self, n_splits: int = 5, random_state: int = 42):
+        self.n_splits     = n_splits
+        self.random_state = random_state
+        self.skf = StratifiedKFold(
+            n_splits=n_splits, shuffle=True, random_state=random_state
+        )
+
+    def run(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        trainer_factory,        # callable() → BaselineKANTrainer | EnsembleKANTrainer
+        num_classes: int,
+        strategy_label: str = "",
+        verbose: bool = True
+    ) -> List[FoldMetrics]:
+        avg_mode = "binary" if num_classes == 2 else "weighted"
+        fold_metrics: List[FoldMetrics] = []
+
+        for fold_idx, (tr_idx, va_idx) in enumerate(
+            self.skf.split(X, y), start=1
+        ):
+            if verbose:
+                print(
+                    f"    [{strategy_label}] Fold {fold_idx}/{self.n_splits} ...",
+                    end=" ", flush=True
+                )
+
+            X_tr, X_va = X[tr_idx], X[va_idx]
+            y_tr, y_va = y[tr_idx], y[va_idx]
+
+            # Fit scaler on training fold only — no leakage
+            scaler   = StandardScaler()
+            X_tr_s   = scaler.fit_transform(X_tr)
+            X_va_s   = scaler.transform(X_va)
+
+            trainer  = trainer_factory()
+            tr_loss, va_loss = trainer.fit(X_tr_s, y_tr, X_va_s, y_va)
+            preds    = trainer.predict(X_va_s)
+
+            fm = FoldMetrics(
+                fold=fold_idx,
+                accuracy=accuracy_score(y_va, preds),
+                precision=precision_score(y_va, preds, average=avg_mode, zero_division=0),
+                recall=recall_score(y_va, preds, average=avg_mode, zero_division=0),
+                f1=f1_score(y_va, preds, average=avg_mode, zero_division=0),
+                train_loss=tr_loss,
+                val_loss=va_loss
+            )
+            fold_metrics.append(fm)
+
+            if verbose:
+                print(
+                    f"Acc={fm.accuracy:.4f} | Prec={fm.precision:.4f} | "
+                    f"Rec={fm.recall:.4f} | F1={fm.f1:.4f}"
+                )
+
+        return fold_metrics
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SECTION 5 — VISUALIZER
+# ═════════════════════════════════════════════════════════════════════════════
+
+class ResultVisualizer:
+    """Generates and saves all plots."""
+
+    METRICS = ["accuracy", "precision", "recall", "f1"]
+
+    # Colors per metric
+    METRIC_COLORS = {
+        "accuracy":  "#2563EB",
+        "precision": "#16A34A",
+        "recall":    "#D97706",
+        "f1":        "#9333EA",
+    }
+
+    # Colors per strategy
+    STRATEGY_COLORS = {
+        "Baseline": "#E53E3E",    # red
+        "Ensemble": "#2B6CB0",    # blue
+    }
+
+    def __init__(self, save_dir: str):
+        self.save_dir = save_dir
+        os.makedirs(save_dir, exist_ok=True)
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _safe(name: str) -> str:
+        return (name.replace(" ", "_").replace("/", "-")
+                    .replace("(", "").replace(")", ""))
+
+    # ── 1. Per-fold box plot (one strategy, one dataset) ──────────────────────
+
+    def plot_fold_boxplot(self, result: StrategyResult, suffix: str = "") -> str:
+        fig, axes = plt.subplots(1, 4, figsize=(16, 5), sharey=False)
+        fig.suptitle(
+            f"Per-Fold Metrics [{result.strategy_name}] — {result.dataset_name}\n"
+            f"(5-Fold CV, n={result.n_samples})",
+            fontsize=12, fontweight="bold", y=1.01
+        )
+
+        for ax, metric in zip(axes, self.METRICS):
+            values = [getattr(fm, metric) for fm in result.fold_metrics]
+            ci     = getattr(result, f"ci_{metric}")
+            color  = self.METRIC_COLORS[metric]
+
+            bp = ax.boxplot(
+                values, patch_artist=True,
+                medianprops=dict(color="white", linewidth=2),
+                whiskerprops=dict(color=color, linewidth=1.5),
+                capprops=dict(color=color, linewidth=1.5),
+                flierprops=dict(marker="o", markerfacecolor=color, markersize=5)
+            )
+            bp["boxes"][0].set_facecolor(color)
+            bp["boxes"][0].set_alpha(0.72)
+
+            rng = np.random.default_rng(seed=0)
+            jitter = rng.uniform(-0.07, 0.07, len(values))
+            for j, v in enumerate(values):
+                ax.scatter(1 + jitter[j], v, color=color, zorder=5,
+                           s=38, edgecolors="white", linewidths=0.7)
+                ax.annotate(f"F{j+1}", (1 + jitter[j], v),
+                            textcoords="offset points", xytext=(5, 0),
+                            fontsize=7, color="#555")
+
+            ax.set_title(metric.capitalize(), fontsize=11, fontweight="bold")
+            ax.set_xticks([])
+            lo = max(0.0, min(values) - 0.08)
+            hi = min(1.0, max(values) + 0.08)
+            ax.set_ylim(lo, hi)
+            ax.yaxis.set_major_formatter(
+                plt.FuncFormatter(lambda v, _: f"{v:.2f}")
+            )
+            ax.set_xlabel(
+                f"Mean={ci.mean:.4f}\n95% CI [{ci.lower:.4f}, {ci.upper:.4f}]",
+                fontsize=8
+            )
+            ax.grid(axis="y", alpha=0.3, linestyle="--")
+            ax.spines[["top", "right"]].set_visible(False)
+
+        plt.tight_layout()
+        fname = f"{self._safe(result.dataset_name)}_{result.strategy_name.lower()}_boxplot{suffix}.png"
+        path  = os.path.join(self.save_dir, fname)
+        plt.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        return path
+
+    # ── 2. Per-fold line chart (one strategy, one dataset) ───────────────────
+
+    def plot_fold_line(self, result: StrategyResult) -> str:
+        folds = [fm.fold for fm in result.fold_metrics]
+        fig, ax = plt.subplots(figsize=(8, 4))
+
+        for metric in self.METRICS:
+            values = [getattr(fm, metric) for fm in result.fold_metrics]
+            ax.plot(folds, values, marker="o", label=metric.capitalize(),
+                    color=self.METRIC_COLORS[metric], linewidth=1.8, markersize=6)
+
+        ax.set_xticks(folds)
+        ax.set_xticklabels([f"Fold {f}" for f in folds])
+        ax.set_ylim(0, 1.05)
+        ax.set_ylabel("Score", fontsize=11)
+        ax.set_title(
+            f"Per-Fold Trend [{result.strategy_name}] — {result.dataset_name}",
+            fontsize=12, fontweight="bold"
+        )
+        ax.legend(fontsize=9)
+        ax.grid(alpha=0.3, linestyle="--")
+        ax.spines[["top", "right"]].set_visible(False)
+
+        plt.tight_layout()
+        fname = f"{self._safe(result.dataset_name)}_{result.strategy_name.lower()}_line.png"
+        path  = os.path.join(self.save_dir, fname)
+        plt.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        return path
+
+    # ── 3. Confusion matrix ───────────────────────────────────────────────────
+
+    def plot_confusion_matrix(
+        self,
+        result:       StrategyResult,
+        y_true:       np.ndarray,
+        y_pred:       np.ndarray,
+        target_names: List[str],
+        cmap:         str = "Blues"
+    ) -> str:
+        cm  = confusion_matrix(y_true, y_pred)
+        n   = len(target_names)
+        fig, ax = plt.subplots(figsize=(max(6, n * 1.5), max(5, n * 1.3)))
+        sns.heatmap(cm, annot=True, fmt="d", cmap=cmap,
+                    xticklabels=target_names, yticklabels=target_names, ax=ax)
+        ax.set_title(
+            f"Confusion Matrix [{result.strategy_name}] — {result.dataset_name}\n"
+            f"Holdout Acc={result.holdout_accuracy:.4f}",
+            fontsize=12, fontweight="bold"
+        )
+        ax.set_ylabel("Actual")
+        ax.set_xlabel("Predicted")
+        plt.tight_layout()
+
+        fname = (f"{self._safe(result.dataset_name)}"
+                 f"_{result.strategy_name.lower()}_cm.png")
+        path  = os.path.join(self.save_dir, fname)
+        plt.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        return path
+
+    # ── 4. Side-by-side Baseline vs Ensemble per dataset ─────────────────────
+
+    def plot_comparison_bar(self, pair: DatasetPair) -> str:
+        """
+        Grouped bar chart comparing Baseline vs Ensemble on all 4 metrics,
+        with 95% CI error bars.
+        """
+        x      = np.arange(len(self.METRICS))
+        width  = 0.32
+        labels = [m.capitalize() for m in self.METRICS]
+
+        fig, ax = plt.subplots(figsize=(9, 5))
+
+        for i, (strategy, result) in enumerate(
+            [("Baseline", pair.baseline), ("Ensemble", pair.ensemble)]
+        ):
+            means  = [getattr(result, f"ci_{m}").mean       for m in self.METRICS]
+            lowers = [getattr(result, f"ci_{m}").lower      for m in self.METRICS]
+            uppers = [getattr(result, f"ci_{m}").upper      for m in self.METRICS]
+            errs   = [
+                [m - lo for m, lo in zip(means, lowers)],
+                [hi - m for m, hi in zip(means, uppers)]
+            ]
+            color  = self.STRATEGY_COLORS[strategy]
+            bars   = ax.bar(
+                x + i * width, means, width,
+                label=strategy, color=color, alpha=0.82,
+                yerr=errs, capsize=5,
+                error_kw={"elinewidth": 1.4, "ecolor": "#222"}
+            )
+            # Annotate bar tops
+            for bar, mean in zip(bars, means):
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + 0.012,
+                    f"{mean:.3f}", ha="center", va="bottom",
+                    fontsize=8, color="#333"
+                )
+
+        ax.set_xticks(x + width / 2)
+        ax.set_xticklabels(labels, fontsize=11)
+        ax.set_ylim(0, 1.15)
+        ax.set_ylabel("Score (95% CI)", fontsize=11)
+        ax.set_title(
+            f"Baseline vs Ensemble — {pair.dataset_name}\n"
+            f"(5-Fold CV, 95% CI error bars)",
+            fontsize=12, fontweight="bold"
+        )
+        ax.legend(fontsize=10)
+        ax.grid(axis="y", alpha=0.3, linestyle="--")
+        ax.spines[["top", "right"]].set_visible(False)
+
+        plt.tight_layout()
+        fname = f"{self._safe(pair.dataset_name)}_comparison_bar.png"
+        path  = os.path.join(self.save_dir, fname)
+        plt.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        return path
+
+    # ── 5. Global summary heatmap (all datasets × all metrics) ───────────────
+
+    def plot_global_heatmap(self, all_pairs: List[DatasetPair]) -> str:
+        """
+        Two side-by-side heatmaps: left = Baseline CI means,
+        right = Ensemble CI means.  Colour intensity encodes score.
+        """
+        dataset_labels = [p.dataset_name for p in all_pairs]
+
+        def _build_matrix(strategy_key: str) -> np.ndarray:
+            rows = []
+            for pair in all_pairs:
+                result = getattr(pair, strategy_key)
+                rows.append([
+                    getattr(result, f"ci_{m}").mean
+                    for m in self.METRICS
+                ])
+            return np.array(rows)
+
+        base_mat = _build_matrix("baseline")
+        ens_mat  = _build_matrix("ensemble")
+        col_labels = [m.capitalize() for m in self.METRICS]
+
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, max(5, len(all_pairs) * 0.65)))
+
+        for ax, mat, title, cmap in [
+            (ax1, base_mat, "Baseline (Single KAN)", "Reds"),
+            (ax2, ens_mat,  "Ensemble Soft Voting",  "Blues")
+        ]:
+            sns.heatmap(
+                mat, ax=ax,
+                xticklabels=col_labels,
+                yticklabels=dataset_labels,
+                annot=True, fmt=".3f", cmap=cmap,
+                vmin=0.5, vmax=1.0,
+                linewidths=0.4, linecolor="#ccc",
+                cbar_kws={"shrink": 0.7}
+            )
+            ax.set_title(title, fontsize=12, fontweight="bold")
+            ax.set_xlabel("Metric", fontsize=10)
+            ax.tick_params(axis="y", labelsize=9)
+
+        fig.suptitle(
+            "CV Mean Score Heatmap — All Datasets (5-Fold, 95% CI means)",
+            fontsize=13, fontweight="bold", y=1.01
+        )
+        plt.tight_layout()
+        path = os.path.join(self.save_dir, "global_heatmap.png")
+        plt.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        return path
+
+    # ── 6. Global grouped bar chart across all datasets ───────────────────────
+
+    def plot_global_summary_bar(self, all_pairs: List[DatasetPair]) -> str:
+        """
+        One subplot per metric, showing Baseline vs Ensemble bars
+        for every dataset side by side.
+        """
+        n = len(all_pairs)
+        x = np.arange(n)
+        width = 0.35
+        d_labels = [p.dataset_name.split("(")[0].strip() for p in all_pairs]
+
+        fig, axes = plt.subplots(2, 2, figsize=(max(16, n * 1.8), 10))
+        axes = axes.flatten()
+
+        for ax, metric in zip(axes, self.METRICS):
+            for i, (strategy, key) in enumerate(
+                [("Baseline", "baseline"), ("Ensemble", "ensemble")]
+            ):
+                means  = [getattr(getattr(p, key), f"ci_{metric}").mean  for p in all_pairs]
+                lowers = [getattr(getattr(p, key), f"ci_{metric}").lower for p in all_pairs]
+                uppers = [getattr(getattr(p, key), f"ci_{metric}").upper for p in all_pairs]
+                errs   = [
+                    [m - lo for m, lo in zip(means, lowers)],
+                    [hi - m for m, hi in zip(means, uppers)]
+                ]
+                ax.bar(
+                    x + i * width, means, width,
+                    label=strategy,
+                    color=self.STRATEGY_COLORS[strategy],
+                    alpha=0.80,
+                    yerr=errs, capsize=4,
+                    error_kw={"elinewidth": 1.2, "ecolor": "#333"}
+                )
+
+            ax.set_xticks(x + width / 2)
+            ax.set_xticklabels(d_labels, rotation=28, ha="right", fontsize=8)
+            ax.set_ylim(0, 1.15)
+            ax.set_ylabel("Score", fontsize=10)
+            ax.set_title(metric.capitalize(), fontsize=11, fontweight="bold")
+            ax.legend(fontsize=9)
+            ax.grid(axis="y", alpha=0.3, linestyle="--")
+            ax.spines[["top", "right"]].set_visible(False)
+
+        fig.suptitle(
+            "Baseline vs Ensemble — All Datasets (5-Fold CV, 95% CI)",
+            fontsize=14, fontweight="bold"
+        )
+        plt.tight_layout()
+        path = os.path.join(self.save_dir, "global_summary_bar.png")
+        plt.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        return path
+
+    # ── 7. Delta bar chart (Ensemble gain over Baseline) ─────────────────────
+
+    def plot_delta_chart(self, all_pairs: List[DatasetPair]) -> str:
+        """
+        Horizontal bars showing Ensemble − Baseline for each metric
+        per dataset.  Green = improvement, red = regression.
+        """
+        n        = len(all_pairs)
+        d_labels = [p.dataset_name.split("(")[0].strip() for p in all_pairs]
+        fig, axes = plt.subplots(1, 4, figsize=(18, max(4, n * 0.55)), sharey=True)
+
+        for ax, metric in zip(axes, self.METRICS):
+            deltas = [
+                getattr(p.ensemble, f"ci_{metric}").mean
+                - getattr(p.baseline, f"ci_{metric}").mean
+                for p in all_pairs
+            ]
+            colors = ["#16A34A" if d >= 0 else "#DC2626" for d in deltas]
+            y_pos  = np.arange(n)
+            ax.barh(y_pos, deltas, color=colors, alpha=0.80)
+            ax.axvline(0, color="#555", linewidth=0.8, linestyle="--")
+            ax.set_yticks(y_pos)
+            if ax == axes[0]:
+                ax.set_yticklabels(d_labels, fontsize=9)
+            ax.set_title(metric.capitalize(), fontsize=11, fontweight="bold")
+            ax.set_xlabel("Δ (Ensemble − Baseline)", fontsize=8)
+            ax.grid(axis="x", alpha=0.3, linestyle="--")
+            ax.spines[["top", "right"]].set_visible(False)
+
+            for i, d in enumerate(deltas):
+                ax.text(
+                    d + (0.002 if d >= 0 else -0.002),
+                    i,
+                    f"{d:+.3f}",
+                    va="center",
+                    ha="left" if d >= 0 else "right",
+                    fontsize=7
+                )
+
+        fig.suptitle(
+            "Ensemble Gain Over Baseline  (green=improvement, red=regression)",
+            fontsize=12, fontweight="bold"
+        )
+        plt.tight_layout()
+        path = os.path.join(self.save_dir, "delta_chart.png")
+        plt.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        return path
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SECTION 6 — RESULT EXPORTER
+# ═════════════════════════════════════════════════════════════════════════════
+
+class ResultExporter:
+    """Serialises all results to JSON and CSV."""
+
+    def __init__(self, save_dir: str):
+        self.save_dir = save_dir
+        os.makedirs(save_dir, exist_ok=True)
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _strategy_dict(r: StrategyResult) -> dict:
+        folds = [
+            {
+                "fold":       fm.fold,
+                "accuracy":   fm.accuracy,
+                "precision":  fm.precision,
+                "recall":     fm.recall,
+                "f1":         fm.f1,
+                "train_loss": fm.train_loss,
+                "val_loss":   fm.val_loss,
+            }
+            for fm in r.fold_metrics
+        ]
+        cis = {
+            m: {
+                "mean":  getattr(r, f"ci_{m}").mean,
+                "lower": getattr(r, f"ci_{m}").lower,
+                "upper": getattr(r, f"ci_{m}").upper,
+                "std":   getattr(r, f"ci_{m}").std,
+            }
+            for m in ["accuracy", "precision", "recall", "f1"]
+        }
+        return {
+            "cv_folds": folds,
+            "cv_confidence_intervals_95": cis,
+            "holdout": {
+                "accuracy":  r.holdout_accuracy,
+                "precision": r.holdout_precision,
+                "recall":    r.holdout_recall,
+                "f1":        r.holdout_f1,
+                "loss":      r.holdout_loss,
+            }
+        }
+
+    # ── exports ───────────────────────────────────────────────────────────────
+
+    def export_json(self, all_pairs: List[DatasetPair]) -> str:
+        payload = []
+        for p in all_pairs:
+            payload.append({
+                "dataset":    p.dataset_name,
+                "n_samples":  p.baseline.n_samples,
+                "n_features": p.baseline.n_features,
+                "n_classes":  p.baseline.n_classes,
+                "baseline":   self._strategy_dict(p.baseline),
+                "ensemble":   self._strategy_dict(p.ensemble),
+            })
+        path = os.path.join(self.save_dir, "combined_results.json")
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=4)
+        return path
+
+    def export_csv_summary(self, all_pairs: List[DatasetPair]) -> str:
+        rows = []
+        for p in all_pairs:
+            row: Dict = {
+                "Dataset":    p.dataset_name,
+                "N_Samples":  p.baseline.n_samples,
+                "N_Features": p.baseline.n_features,
+                "N_Classes":  p.baseline.n_classes,
+            }
+            for strategy, key in [("Base", "baseline"), ("Ens", "ensemble")]:
+                r = getattr(p, key)
+                for m in ["accuracy", "precision", "recall", "f1"]:
+                    ci  = getattr(r, f"ci_{m}")
+                    hw  = ci.half_width
+                    row[f"{strategy}_{m}_mean"]  = round(ci.mean,  4)
+                    row[f"{strategy}_{m}_pm"]    = round(hw,       4)
+                    row[f"{strategy}_{m}_lower"] = round(ci.lower, 4)
+                    row[f"{strategy}_{m}_upper"] = round(ci.upper, 4)
+                    row[f"{strategy}_{m}_std"]   = round(ci.std,   4)
+                row[f"{strategy}_holdout_acc"]   = round(r.holdout_accuracy,  4)
+                row[f"{strategy}_holdout_prec"]  = round(r.holdout_precision, 4)
+                row[f"{strategy}_holdout_rec"]   = round(r.holdout_recall,    4)
+                row[f"{strategy}_holdout_f1"]    = round(r.holdout_f1,        4)
+            rows.append(row)
+
+        path = os.path.join(self.save_dir, "summary_table.csv")
+        pd.DataFrame(rows).to_csv(path, index=False)
+        return path
+
+    def export_csv_per_fold(self, all_pairs: List[DatasetPair]) -> str:
+        rows = []
+        for p in all_pairs:
+            for strategy, key in [("Baseline", "baseline"), ("Ensemble", "ensemble")]:
+                r = getattr(p, key)
+                for fm in r.fold_metrics:
+                    rows.append({
+                        "Dataset":    p.dataset_name,
+                        "Strategy":   strategy,
+                        "Fold":       fm.fold,
+                        "Accuracy":   round(fm.accuracy,   4),
+                        "Precision":  round(fm.precision,  4),
+                        "Recall":     round(fm.recall,     4),
+                        "F1":         round(fm.f1,         4),
+                        "Train_Loss": round(fm.train_loss, 4),
+                        "Val_Loss":   round(fm.val_loss,   4),
+                    })
+        path = os.path.join(self.save_dir, "per_fold_metrics.csv")
+        pd.DataFrame(rows).to_csv(path, index=False)
+        return path
+
+    def export_csv_delta(self, all_pairs: List[DatasetPair]) -> str:
+        """Delta table: Ensemble CI mean − Baseline CI mean per metric."""
+        rows = []
+        for p in all_pairs:
+            row: Dict = {"Dataset": p.dataset_name}
+            for m in ["accuracy", "precision", "recall", "f1"]:
+                base_mean = getattr(p.baseline, f"ci_{m}").mean
+                ens_mean  = getattr(p.ensemble, f"ci_{m}").mean
+                row[f"delta_{m}"] = round(ens_mean - base_mean, 4)
+            rows.append(row)
+        path = os.path.join(self.save_dir, "delta_table.csv")
+        pd.DataFrame(rows).to_csv(path, index=False)
+        return path
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SECTION 7 — COMBINED PIPELINE ORCHESTRATOR
+# ═════════════════════════════════════════════════════════════════════════════
+
+class KANCombinedPipeline:
+    """
+    Main orchestrator.
+    For each dataset:
+      1. Load & split (hold-out 20%)
+      2. Run 5-Fold CV for Baseline strategy
+      3. Run 5-Fold CV for Ensemble strategy
+      4. Train final Baseline model on full train set → holdout evaluation
+      5. Train final Ensemble model on full train set → holdout evaluation
+      6. Compute 95% CIs for both strategies
+      7. Generate per-dataset visualizations
+    After all datasets:
+      8. Generate global comparison charts
+      9. Export JSON + CSVs
+     10. Print summary tables
+    """
+
+    KAN_PARAMS = {
+        "n_hidden": 5,
+        "grid":     5,
+        "k":        4,
+        "lr":       0.01,
+        "lamb":     0.01,
+        "steps":    50,
+    }
+    N_ENSEMBLE_MEMBERS = 5
+
+    def __init__(
+        self,
+        save_dir:     str   = "./kan_combined_results",
+        n_folds:      int   = 5,
+        holdout_size: float = 0.2,
+        random_state: int   = 42,
+        verbose:      bool  = True
+    ):
+        self.save_dir     = save_dir
+        self.n_folds      = n_folds
+        self.holdout_size = holdout_size
+        self.random_state = random_state
+        self.verbose      = verbose
+
+        os.makedirs(save_dir, exist_ok=True)
+
+        self.cv  = CrossValidator(n_splits=n_folds, random_state=random_state)
+        self.viz = ResultVisualizer(save_dir)
+        self.exp = ResultExporter(save_dir)
+
+        self.loaders: List[BaseDatasetLoader] = [
+            BreastCancerLoader(),
+            HepatitisLoader(),
+            LiverLoader(),
+            ParkinsonsLoader(),
+            DiabetesLoader(),
+            DermatologyLoader(),
+            WPBCLoader(),
+            HeartDiseaseLoader(),
+            CTGLoader(),
+        ]
+
+        self.all_pairs: List[DatasetPair] = []
+
+    # ── logging ───────────────────────────────────────────────────────────────
+
+    def _log(self, msg: str) -> None:
+        if self.verbose:
+            print(msg)
+
+    def _sep(self, char: str = "─", n: int = 72) -> None:
+        self._log(char * n)
+
+    # ── per-dataset processing ────────────────────────────────────────────────
+
+    def _make_baseline_factory(self, num_features: int, num_classes: int):
+        """Returns a callable that creates a fresh BaselineKANTrainer."""
+        params = self.KAN_PARAMS.copy()
+        def factory():
+            return BaselineKANTrainer(
+                num_features=num_features,
+                num_classes=num_classes,
+                params=params,
+                seed=self.random_state
+            )
+        return factory
+
+    def _make_ensemble_factory(self, num_features: int, num_classes: int):
+        """Returns a callable that creates a fresh EnsembleKANTrainer."""
+        params    = self.KAN_PARAMS.copy()
+        n_members = self.N_ENSEMBLE_MEMBERS
+        def factory():
+            return EnsembleKANTrainer(
+                num_features=num_features,
+                num_classes=num_classes,
+                params=params,
+                n_members=n_members
+            )
+        return factory
+
+    def _process_dataset(self, loader: BaseDatasetLoader) -> Optional[DatasetPair]:
+        self._sep()
+        self._log(f"  Dataset : {loader.name}")
+
+        try:
+            X, y, target_names = loader.load()
+        except Exception as exc:
+            self._log(f"  [ERROR] Could not load {loader.name}: {exc}")
+            return None
+
+        n_samples, n_features = X.shape
+        n_classes = len(np.unique(y))
+        avg_mode  = "binary" if n_classes == 2 else "weighted"
+
+        self._log(f"  Samples={n_samples}  Features={n_features}  Classes={n_classes}")
+
+        # ── Hold-out split (fixed, stratified) ───────────────────────────────
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y,
+            test_size=self.holdout_size,
+            random_state=self.random_state,
+            stratify=y
+        )
+
+        # ── Prepare StrategyResult containers ────────────────────────────────
+        base_result = StrategyResult(
+            strategy_name="Baseline",
+            dataset_name=loader.name,
+            n_samples=n_samples, n_features=n_features, n_classes=n_classes
+        )
+        ens_result = StrategyResult(
+            strategy_name="Ensemble",
+            dataset_name=loader.name,
+            n_samples=n_samples, n_features=n_features, n_classes=n_classes
+        )
+
+        # ══ STRATEGY A: Baseline 5-Fold CV ════════════════════════════════════
+        self._log(f"\n  [Baseline] Running {self.n_folds}-Fold CV …")
+        base_result.fold_metrics = self.cv.run(
+            X_train, y_train,
+            trainer_factory=self._make_baseline_factory(n_features, n_classes),
+            num_classes=n_classes,
+            strategy_label="Baseline",
+            verbose=self.verbose
+        )
+        base_result.compute_confidence_intervals()
+
+        # ══ STRATEGY B: Ensemble Soft Voting 5-Fold CV ════════════════════════
+        self._log(f"\n  [Ensemble] Running {self.n_folds}-Fold CV …")
+        ens_result.fold_metrics = self.cv.run(
+            X_train, y_train,
+            trainer_factory=self._make_ensemble_factory(n_features, n_classes),
+            num_classes=n_classes,
+            strategy_label="Ensemble",
+            verbose=self.verbose
+        )
+        ens_result.compute_confidence_intervals()
+
+        # ══ FINAL HOLDOUT — Baseline ══════════════════════════════════════════
+        self._log("\n  [Baseline] Training final model on full training set …")
+        scaler   = StandardScaler()
+        X_tr_s   = scaler.fit_transform(X_train)
+        X_te_s   = scaler.transform(X_test)
+
+        base_trainer = BaselineKANTrainer(
+            n_features, n_classes, self.KAN_PARAMS.copy(), seed=self.random_state
+        )
+        base_trainer.fit(X_tr_s, y_train, X_te_s, y_test)
+        base_preds = base_trainer.predict(X_te_s)
+
+        base_result.holdout_accuracy  = accuracy_score(y_test, base_preds)
+        base_result.holdout_precision = precision_score(y_test, base_preds, average=avg_mode, zero_division=0)
+        base_result.holdout_recall    = recall_score(y_test, base_preds, average=avg_mode, zero_division=0)
+        base_result.holdout_f1        = f1_score(y_test, base_preds, average=avg_mode, zero_division=0)
+        base_result.holdout_loss      = base_trainer.predict_loss(X_te_s, y_test)
+
+        # ══ FINAL HOLDOUT — Ensemble ══════════════════════════════════════════
+        self._log("  [Ensemble] Training final ensemble on full training set …")
+        ens_trainer = EnsembleKANTrainer(
+            n_features, n_classes, self.KAN_PARAMS.copy(),
+            n_members=self.N_ENSEMBLE_MEMBERS
+        )
+        ens_trainer.fit(X_tr_s, y_train, X_te_s, y_test)
+        ens_preds = ens_trainer.predict(X_te_s)
+
+        ens_result.holdout_accuracy  = accuracy_score(y_test, ens_preds)
+        ens_result.holdout_precision = precision_score(y_test, ens_preds, average=avg_mode, zero_division=0)
+        ens_result.holdout_recall    = recall_score(y_test, ens_preds, average=avg_mode, zero_division=0)
+        ens_result.holdout_f1        = f1_score(y_test, ens_preds, average=avg_mode, zero_division=0)
+        ens_result.holdout_loss      = ens_trainer.predict_loss(X_te_s, y_test)
+
+        # ── Print result summary ──────────────────────────────────────────────
+        for label, result in [("Baseline", base_result), ("Ensemble", ens_result)]:
+            self._log(
+                f"\n  [{label}] Holdout → "
+                f"Acc={result.holdout_accuracy:.4f} | "
+                f"Prec={result.holdout_precision:.4f} | "
+                f"Rec={result.holdout_recall:.4f} | "
+                f"F1={result.holdout_f1:.4f}"
+            )
+            self._log(f"  [{label}] 95% CIs (CV):")
+            for m in ["accuracy", "precision", "recall", "f1"]:
+                self._log(f"    {m.capitalize():<12}: {getattr(result, f'ci_{m}')}")
+
+        # Classification reports
+        self._log(f"\n  [Baseline] Classification Report (Holdout):")
+        self._log(classification_report(y_test, base_preds, target_names=target_names, zero_division=0))
+        self._log(f"  [Ensemble] Classification Report (Holdout):")
+        self._log(classification_report(y_test, ens_preds, target_names=target_names, zero_division=0))
+
+        # ── Build pair ────────────────────────────────────────────────────────
+        pair = DatasetPair(
+            dataset_name=loader.name,
+            target_names=target_names,
+            baseline=base_result,
+            ensemble=ens_result,
+            y_test=y_test,
+            baseline_preds=base_preds,
+            ensemble_preds=ens_preds
+        )
+
+        # ── Per-dataset plots ─────────────────────────────────────────────────
+        self._log("\n  Generating per-dataset visualizations …")
+        self.viz.plot_fold_boxplot(base_result)
+        self.viz.plot_fold_boxplot(ens_result)
+        self.viz.plot_fold_line(base_result)
+        self.viz.plot_fold_line(ens_result)
+        self.viz.plot_confusion_matrix(base_result, y_test, base_preds, target_names, cmap="Greens")
+        self.viz.plot_confusion_matrix(ens_result,  y_test, ens_preds,  target_names, cmap="Blues")
+        self.viz.plot_comparison_bar(pair)
+
+        return pair
+
+    # ── main entry point ──────────────────────────────────────────────────────
+
+    def run(self) -> None:
+        self._sep("═")
+        self._log("  KAN Combined Evaluator — Baseline vs Ensemble Soft Voting")
+        self._log(f"  Device        : {torch.device('cuda' if torch.cuda.is_available() else 'cpu')}")
+        self._log(f"  KAN Params    : {json.dumps(self.KAN_PARAMS)}")
+        self._log(f"  Ensemble size : {self.N_ENSEMBLE_MEMBERS} sub-models (seeds 0–{self.N_ENSEMBLE_MEMBERS-1})")
+        self._log(f"  CV Folds      : {self.n_folds}")
+        self._log(f"  Hold-out      : {int(self.holdout_size*100)}%")
+        self._sep("═")
+
+        for loader in self.loaders:
+            pair = self._process_dataset(loader)
+            if pair is not None:
+                self.all_pairs.append(pair)
+
+        # ── Global visualizations ─────────────────────────────────────────────
+        if self.all_pairs:
+            self._sep()
+            self._log("\n  Generating global visualizations …")
+            self.viz.plot_global_summary_bar(self.all_pairs)
+            self.viz.plot_global_heatmap(self.all_pairs)
+            self.viz.plot_delta_chart(self.all_pairs)
+
+            # ── Export ───────────────────────────────────────────────────────
+            self._log("  Exporting results …")
+            p1 = self.exp.export_json(self.all_pairs)
+            p2 = self.exp.export_csv_summary(self.all_pairs)
+            p3 = self.exp.export_csv_per_fold(self.all_pairs)
+            p4 = self.exp.export_csv_delta(self.all_pairs)
+            self._log(f"    JSON          → {p1}")
+            self._log(f"    Summary CSV   → {p2}")
+            self._log(f"    Per-fold CSV  → {p3}")
+            self._log(f"    Delta CSV     → {p4}")
+
+            # ── Console summary tables ────────────────────────────────────────
+            self._print_summary_table("Baseline", "baseline")
+            self._print_summary_table("Ensemble", "ensemble")
+            self._print_delta_table()
+
+        self._log(f"\n  All done!  Results saved to: {self.save_dir}\n")
+
+    def _print_summary_table(self, label: str, key: str) -> None:
+        self._sep()
+        self._log(f"SUMMARY — {label}  (5-Fold CV, 95% CI)")
+        self._sep()
+        hdr = (f"{'Dataset':<30} {'Accuracy':^22} {'Precision':^22}"
+               f" {'Recall':^22} {'F1':^22}")
+        self._log(hdr)
+        self._log("-" * len(hdr))
+        for p in self.all_pairs:
+            r = getattr(p, key)
+            cols = []
+            for m in ["accuracy", "precision", "recall", "f1"]:
+                ci = getattr(r, f"ci_{m}")
+                cols.append(f"{ci.mean:.4f} ± {ci.half_width:.4f}")
+            self._log(
+                f"{p.dataset_name:<30} {cols[0]:^22} {cols[1]:^22}"
+                f" {cols[2]:^22} {cols[3]:^22}"
+            )
+        self._log("-" * len(hdr))
+
+    def _print_delta_table(self) -> None:
+        self._sep()
+        self._log("DELTA TABLE — Ensemble − Baseline CI Means  (+ = improvement)")
+        self._sep()
+        hdr = (f"{'Dataset':<30} {'ΔAccuracy':^14} {'ΔPrecision':^14}"
+               f" {'ΔRecall':^14} {'ΔF1':^14}")
+        self._log(hdr)
+        self._log("-" * len(hdr))
+        for p in self.all_pairs:
+            deltas = []
+            for m in ["accuracy", "precision", "recall", "f1"]:
+                d = (getattr(p.ensemble, f"ci_{m}").mean
+                     - getattr(p.baseline, f"ci_{m}").mean)
+                deltas.append(f"{d:+.4f}")
+            self._log(
+                f"{p.dataset_name:<30} {deltas[0]:^14} {deltas[1]:^14}"
+                f" {deltas[2]:^14} {deltas[3]:^14}"
+            )
+        self._log("-" * len(hdr))
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SECTION 8 — ENTRY POINT
+# ═════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    # Google Colab auto-detection
+    try:
+        from google.colab import drive as _drive
+        _drive.mount("/content/drive")
+        SAVE_DIR = ("/content/drive/MyDrive/Colab_Notebooks/medical"
+                    "/kan_combined_baseline_ensemble")
+    except (ImportError, Exception):
+        SAVE_DIR = "./kan_combined_baseline_ensemble"
+
+    pipeline = KANCombinedPipeline(
+        save_dir=SAVE_DIR,
+        n_folds=5,
+        holdout_size=0.2,
+        random_state=42,
+        verbose=True
+    )
+    pipeline.run()
